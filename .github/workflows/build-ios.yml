@@ -1,0 +1,132 @@
+name: Build Madeira (unsigned)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+jobs:
+  build:
+    name: Build unsigned Madeira.app
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode and inspect SDKs
+        run: |
+          sudo xcode-select -s "$DEVELOPER_DIR"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Install build tools
+        run: |
+          brew install cmake ninja meson pkg-config autoconf automake libtool gettext openssl@3 sevenzip
+
+      - name: Download llvm-mingw
+        run: |
+          mkdir -p toolchains
+          curl -L --fail --retry 3 \
+            https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz \
+            | tar -xJ -C toolchains
+
+      - name: Configure FEX for iOS arm64
+        run: |
+          cmake -S FEX -B FEX/build-ios -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DBUILD_THUNKS=OFF \
+            -DENABLE_CCACHE=OFF \
+            -DENABLE_FEXCORE_PROFILER=OFF \
+            -DENABLE_VIXL_DISASSEMBLER=OFF \
+            -DENABLE_VIXL_SIMULATOR=OFF \
+            -DENABLE_ZYDIS=OFF
+          cmake --build FEX/build-ios --parallel 3
+
+      - name: Build Wine host and ARM64EC prerequisites
+        run: |
+          mkdir -p wine/build-macos wine/build-arm64ec
+          cd wine/build-macos
+          ../configure --enable-win64 --disable-tests --without-x --without-wayland --without-xinerama
+          make -j3 tools/winebuild tools/widl dlls/ntdll
+
+      - name: Build iOS native libraries
+        run: |
+          bash build/freetype-ios/build.sh
+          bash build/gnutls-ios/build.sh
+          bash build/wineserver/build.sh
+          bash build/win32u-unix/build.sh
+          bash build/ntdll-unix/build.sh
+
+      - name: Build DXMT
+        working-directory: research/dxmt
+        run: |
+          ln -sfn ../../toolchains toolchains
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            PATH="$(pwd)/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:$PATH" \
+            meson setup --cross-file build-aarch64-win.txt --native-file build-osx.txt \
+              -Dwine_build_path=../../wine/build-macos build-pe
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            PATH="$(pwd)/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:$PATH" \
+            meson compile -C build-pe
+          mkdir -p ../../app/Madeira/aarch64-windows
+          cp build-pe/src/d3d11/d3d11.dll \
+             build-pe/src/dxgi/dxgi.dll \
+             build-pe/src/winemetal/winemetal.dll \
+             build-pe/src/d3d10/d3d10core.dll \
+             ../../app/Madeira/aarch64-windows/
+          bash build.sh
+          xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a \
+            obj/*.o ../../toolchains/llvm-ios-build/lib/*.a
+          cp libdxmt_combined.a ../../app/Madeira/
+
+      - name: Supply optional Microsoft runtime files
+        if: ${{ hashFiles('app/Madeira/x86_64-vcruntime/*.dll') != '' }}
+        run: echo "Using caller-supplied Microsoft Visual C++ runtime DLLs"
+
+      - name: Build unsigned app
+        run: |
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -scheme Madeira \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination generic/platform=iOS \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package app artifact
+        run: |
+          mkdir -p artifacts
+          find ~/Library/Developer/Xcode/DerivedData -path '*/Build/Products/Release-iphoneos/Madeira.app' -type d -exec cp -R {} artifacts/ \; -quit
+          test -d artifacts/Madeira.app
+          ditto -c -k --sequesterRsrc --keepParent artifacts/Madeira.app artifacts/Madeira-unsigned.zip
+
+      - name: Upload unsigned app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-unsigned-${{ github.sha }}
+          path: artifacts/Madeira-unsigned.zip
+          if-no-files-found: error
+          retention-days: 14
